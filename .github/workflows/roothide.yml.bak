@@ -1,0 +1,105 @@
+# 功能：这是一个 GitHub Actions 工作流文件，用于定期构建和上传一个名为 "roothide-Dopamine2-v14.tipa" 的文件。
+
+name: "*** build tipa file ***"  # 工作流的名称，用于标识工作流的功能
+
+# 触发工作流的事件
+on:
+  schedule:
+    - cron: '0 */2 * * *'  # 每隔两小时自动触发一次工作流
+  workflow_dispatch:  # 允许手动触发工作流
+
+# 并发控制，确保同一工作流和分支的并发任务不会同时运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}  # 并发组的名称，由工作流名称和分支名称组成
+  cancel-in-progress: true  # 如果有正在运行的任务，新的触发会取消当前任务
+
+# 定义工作流中的作业
+jobs:
+  build:
+    runs-on: macos-13  # 指定作业运行的操作系统环境，这里使用 macOS 13
+    steps:
+
+      # 第一步：检出代码
+      - name: Checkout
+        run: |
+          set -x  # 打印命令执行的详细信息
+          git clone --recursive -b v14 https://github.com/yangshuguang21/Dopamine2-roothide1.git ${{ github.workspace }}
+          # 从指定的仓库和分支克隆代码到工作空间，包括子模块
+
+      # 第二步：安装 Procursus 工具集
+      - name: Install Procursus
+        uses: dhinakg/procursus-action@main  # 使用 Procursus 的 GitHub Actions
+        with:
+          packages: ldid findutils sed coreutils make  # 安装所需的工具集
+
+      # 第三步：安装 THEOS 构建工具
+      - name: Install THEOS
+        run: |
+          set -x
+          export BASEDIR="$(pwd)"  # 设置当前工作目录
+          export THEOS="${BASEDIR}/theos"  # 设置 THEOS 的安装路径
+          mkdir -p $THEOS  # 创建 THEOS 目录
+          curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos >> install-theos.sh
+          # 下载 THEOS 安装脚本
+          gsed -E "/^\s*get_theos\s*$/,+1 s/^(\s*)(get_sdks)\s*$/\1mkdir -p \${THEOS}\/sdks\n\1touch \${THEOS}\/sdks\/sdk\n\1\2/g" -i install-theos.sh
+          # 修改安装脚本以适应当前环境
+          bash install-theos.sh  # 执行安装脚本
+          curl -L https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz --output $THEOS/sdks/iPhoneOS16.5.sdk.tar.xz
+          # 下载 iOS 16.5 SDK
+          gunzip $THEOS/sdks/iPhoneOS16.5.sdk.tar.xz  # 解压 SDK
+          tar -xf $THEOS/sdks/iPhoneOS16.5.sdk.tar -C $THEOS/sdks
+          rm $THEOS/sdks/iPhoneOS16.5.sdk.tar  # 删除 SDK 压缩文件
+          cd $BASEDIR  # 返回工作目录
+
+      # 第四步：构建并安装 trustcache 工具
+      - name: Build and Install trustcache
+        run: |
+          set -x
+          git clone https://github.com/CRKatri/trustcache  # 克隆 trustcache 仓库
+          cd trustcache  # 进入 trustcache 目录
+          gmake -j$(sysctl -n hw.physicalcpu) OPENSSL=1  # 使用 gmake 构建工具
+          sudo cp trustcache /opt/procursus/bin/  # 将构建结果复制到 Procursus 的 bin 目录
+
+      # 第五步：设置环境变量
+      - name: Set Environment Variables
+        run: |
+          set -x
+          T2=$(TZ=UTC-2 date +'%Y%m%d_%H%M%S')  # 获取当前时间（UTC-2）
+          TS=$(date -j -f "%Y%m%d_%H%M%S" "${T2}" +%s)  # 将时间转换为时间戳
+          SHASH=$(git rev-parse --short HEAD)  # 获取当前提交的短哈希值
+          echo "ctime=${T2}" >> $GITHUB_ENV  # 将构建时间写入环境变量
+          echo "ctimestamp=${TS}" >> $GITHUB_ENV  # 将时间戳写入环境变量
+          echo "shorthash=${SHASH}" >> $GITHUB_ENV  # 将短哈希值写入环境变量
+
+      # 第六步：安装 libarchive 库
+      - name: Install libarchive
+        run: |
+          brew install libarchive  # 使用 Homebrew 安装 libarchive
+
+      # 第七步：构建项目
+      - name: Build
+        run: |
+          set -x
+          export BASEDIR="$(pwd)"  # 设置工作目录
+          export THEOS="${BASEDIR}/theos"  # 设置 THEOS 路径
+          typeset itemcount=$(plutil -extract items raw -expect array ./Application/Dopamine/UI/Settings/Credits.plist)
+          # 获取 Credits.plist 中的项目数量
+          for ((i=0; i<$itemcount; i++)); do
+            if [ "$(plutil -extract items.$i.headerCellClass raw ./Application/Dopamine/UI/Settings/Credits.plist)" = "DOCreditsCell" ]; then
+              DOCreditsCellIndex=$i  # 找到 DOCreditsCell 的索引
+            fi
+          done
+          plutil -insert items.$DOCreditsCellIndex.names -xml "<dict><key>name</key><string>${{ github.actor }}</string><key>link</key><string>https://github.com/${{ github.repository }}</string></dict>" -append ./Application/Dopamine/UI/Settings/Credits.plist
+          # 向 Credits.plist 中添加贡献者信息
+          gmake -j$(sysctl -n hw.physicalcpu)  # 使用 gmake 构建项目
+          mv ./Application/Dopamine.tipa "./Application/roothide-Dopamine2-v14.tipa"  # 重命名构建结果
+          echo "tag=v14" >> $GITHUB_ENV  # 将版本标签写入环境变量
+
+      # 第八步：上传构建结果
+      - name: Upload Artifact
+        id: dopamine-latest-upload
+        uses: actions/upload-artifact@v4  # 使用上传工具
+        with:
+          name: roothide-Dopamine2-v14.tipa  # 构建结果的名称
+          path: |
+            ${{ github.workspace }}/Application/roothide-Dopamine2-v14.tipa  # 构建结果的路径
